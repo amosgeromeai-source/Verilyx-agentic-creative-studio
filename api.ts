@@ -1,178 +1,128 @@
-import { IS_WEBHOOK_CONFIGURED, N8N_WEBHOOK_URL } from '@/config';
-import { normalizeProduction, withRequestFallbacks } from './normalize';
-import type { AppError, CreateProductionRequest, NormalizedProduction } from '@/types';
-
 /**
- * Client for the n8n webhook.
+ * Shapes exchanged with the n8n backend.
  *
- * Deliberately has NO request timeout: the agent chain can legitimately run for
- * several minutes. The request is only aborted if the user leaves the screen.
- *
- * The client does not interpret the payload — it hands whatever came back to
- * `normalizeProduction`, the single place that understands n8n's field names.
+ * The raw response is deliberately typed loosely: n8n workflows rename, nest and
+ * stringify fields as they are edited, so the UI never consumes the raw payload.
+ * `src/utils/normalize.ts` converts whatever arrives into `NormalizedProduction`,
+ * which is the ONLY shape components are allowed to read.
  */
 
-function makeError(error: AppError): AppError {
-  console.error(`[Verilyx] ${error.kind}:`, error.detail ?? error.message);
-  return error;
+/** POST body sent to VITE_N8N_WEBHOOK_URL. */
+export interface CreateProductionRequest {
+  project_name: string;
+  idea: string;
+  duration: number;
+  style: string;
+  name: string;
+  email: string;
+  website: string;
 }
 
-const GENERIC_MESSAGE =
-  "Verilyx couldn't complete this request. Your project was not lost. Please try again.";
+/** Canonical run outcomes. */
+export type ProductionStatus =
+  | 'completed'
+  | 'completed_after_revision'
+  | 'needs_human_review';
 
-export interface SubmitOptions {
-  signal?: AbortSignal;
+/** Parsed "STATUS: …" / "FINAL VERDICT: …" verdict found inside a review. */
+export type ReviewVerdict =
+  | 'APPROVED'
+  | 'READY WITH WARNINGS'
+  | 'NEEDS REVISION'
+  | 'NEEDS HUMAN REVIEW'
+  | 'UNKNOWN';
+
+/**
+ * State of the finished MP4 — the actual deliverable.
+ *
+ *  ready         → a playable, absolute URL is available
+ *  processing    → the package is back but Runway/merge is still running
+ *  failed        → the backend reported that generation or merging failed
+ *  unavailable   → a URL came back but cannot be used (relative with no base
+ *                  configured, local-only address, expired/blocked link)
+ *  not_expected  → this run will not produce a video (escalated to a human)
+ */
+export type VideoState = 'ready' | 'processing' | 'failed' | 'unavailable' | 'not_expected';
+
+export interface ProductionVideo {
+  state: VideoState;
+  /** Absolute, playable URL. Empty unless state === 'ready'. */
+  url: string;
+  /** Suggested download filename. */
+  fileName: string;
+  /** Backend job/task id, when one was returned. Used by optional status polling. */
+  jobId: string;
+  /** How many clips were merged, when the backend says. */
+  clipCount: number | null;
+  /** Customer-facing explanation. Never raw backend text — details go to the console. */
+  message: string;
 }
 
-export type SubmitResult =
-  | { ok: true; data: NormalizedProduction }
-  | { ok: false; error: AppError };
+/**
+ * The single stable object every component reads.
+ * Empty string means "the workflow did not return this"; never null-checked ad hoc.
+ */
+export interface NormalizedProduction {
+  success: boolean;
+  /** Canonical status after reconciling the backend field with the review verdict. */
+  status: ProductionStatus;
+  /** Exactly what the backend put in its status field, for display/debugging. */
+  rawStatus: string;
 
-export async function submitProduction(
-  payload: CreateProductionRequest,
-  options: SubmitOptions = {},
-): Promise<SubmitResult> {
-  if (!IS_WEBHOOK_CONFIGURED) {
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'not_configured',
-        title: 'Backend not configured',
-        message:
-          'No n8n webhook URL is set for this build. Add VITE_N8N_WEBHOOK_URL to your environment and redeploy.',
-        detail: `VITE_N8N_WEBHOOK_URL resolved to "${N8N_WEBHOOK_URL}"`,
-      }),
-    };
-  }
+  projectName: string;
+  duration: string | number | null;
+  visualStyle: string;
+  email: string;
+  submittedBy: string;
+  website: string;
+  idea: string;
 
-  let response: Response;
-  try {
-    response = await fetch(N8N_WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(payload),
-      // No timeout — the agent chain may run for minutes.
-      signal: options.signal,
-    });
-  } catch (error) {
-    if (options.signal?.aborted) {
-      return {
-        ok: false,
-        error: makeError({
-          kind: 'network',
-          title: 'Request cancelled',
-          message: 'The request was cancelled before Verilyx received a response.',
-          detail: String(error),
-        }),
-      };
-    }
+  /** Agent outputs. */
+  creativeDirection: string;
+  script: string;
+  scenePlan: string;
+  generationPrompts: string;
 
-    // A browser-level fetch rejection is either a dropped connection or a
-    // blocked cross-origin request; both look identical from JavaScript.
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'cors',
-        title: "Couldn't reach the Verilyx backend",
-        message: GENERIC_MESSAGE,
-        detail:
-          `${String(error)} — the network request failed before a response arrived. ` +
-          'Common causes: the n8n workflow is not active, the URL is wrong, or the ' +
-          'webhook response is missing CORS headers for this origin.',
-      }),
-    };
-  }
+  /** Review chain. */
+  initialReview: string;
+  initialQualityScore: number | null;
+  initialVerdict: ReviewVerdict;
+  revisedPackage: string;
+  finalReview: string;
+  finalQualityScore: number | null;
+  finalVerdict: ReviewVerdict;
 
-  let rawBody = '';
-  try {
-    rawBody = await response.text();
-  } catch (error) {
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'empty',
-        title: 'Empty response',
-        message: GENERIC_MESSAGE,
-        detail: `Could not read response body: ${String(error)}`,
-      }),
-    };
-  }
+  /** The finished MP4 — the primary deliverable. */
+  video: ProductionVideo;
 
-  if (!response.ok) {
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'server',
-        title: `Backend returned ${response.status}`,
-        message: GENERIC_MESSAGE,
-        detail: `HTTP ${response.status} ${response.statusText} — ${rawBody.slice(0, 800)}`,
-      }),
-    };
-  }
+  /** True only when the Revision Agent actually ran. */
+  revised: boolean;
+  /** Agents that ran, out of the seven in the chain. */
+  agentsRun: number;
+  agentsTotal: number;
 
-  if (rawBody.trim().length === 0) {
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'empty',
-        title: 'The backend returned nothing',
-        message:
-          "Verilyx reached the workflow but received an empty response. Your project was not lost — check that the n8n workflow ends with a 'Respond to Webhook' node, then try again.",
-        detail: 'Response body was empty.',
-      }),
-    };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawBody);
-  } catch (error) {
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'invalid_json',
-        title: 'Unreadable response',
-        message: GENERIC_MESSAGE,
-        detail: `JSON parse failed: ${String(error)} — body starts: ${rawBody.slice(0, 400)}`,
-      }),
-    };
-  }
-
-  const normalized = normalizeProduction(parsed);
-  if (!normalized) {
-    return {
-      ok: false,
-      error: makeError({
-        kind: 'invalid_json',
-        title: 'Nothing usable in the response',
-        message: GENERIC_MESSAGE,
-        detail:
-          'The workflow replied, but the payload contained no recognisable agent output ' +
-          `and no status field: ${rawBody.slice(0, 800)}`,
-      }),
-    };
-  }
-
-  // Log what was actually mapped — the fastest way to spot a renamed n8n field.
-  console.info('[Verilyx] normalized response', {
-    status: normalized.status,
-    rawStatus: normalized.rawStatus,
-    revised: normalized.revised,
-    initialQualityScore: normalized.initialQualityScore,
-    finalQualityScore: normalized.finalQualityScore,
-    populated: {
-      creativeDirection: normalized.creativeDirection.length,
-      script: normalized.script.length,
-      scenePlan: normalized.scenePlan.length,
-      generationPrompts: normalized.generationPrompts.length,
-      initialReview: normalized.initialReview.length,
-      revisedPackage: normalized.revisedPackage.length,
-      finalReview: normalized.finalReview.length,
-    },
-  });
-
-  return { ok: true, data: withRequestFallbacks(normalized, payload) };
+  message: string;
+  /** Untouched payload, kept for the error/debug panel only. */
+  raw: unknown;
 }
+
+/** Categories of failure the UI can explain in plain language. */
+export type AppErrorKind =
+  | 'network'
+  | 'cors'
+  | 'server'
+  | 'invalid_json'
+  | 'empty'
+  | 'not_configured'
+  | 'unknown';
+
+export interface AppError {
+  kind: AppErrorKind;
+  title: string;
+  message: string;
+  /** Raw detail — surfaced only in the console and an optional details panel. */
+  detail?: string;
+}
+
+/** Top-level screen the app is showing. */
+export type AppView = 'landing' | 'processing' | 'results' | 'human_review' | 'error';
